@@ -1,0 +1,28 @@
+# Proxmox Connection
+proxmox_api_url          = "https://proxmox.local:8006/api2/json"
+proxmox_api_token_id     = "terraform@pam!terraform"
+proxmox_api_token_secret = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+proxmox_tls_insecure     = true
+proxmox_node             = "pve"
+
+# VM Template - must exist in Proxmox
+# Create with: https://pve.proxmox.com/wiki/Cloud-Init_Support
+template_name = "ubuntu-22.04-cloud"
+
+# VM Configuration
+vm_name     = "amazon-photos-sync"
+vm_cores    = 4
+vm_memory   = 4096  # 4GB RAM
+vm_disk_size = "2000G"  # 2TB for photos storage
+storage_pool = "local-lvm"
+
+# Network
+network_bridge = "vmbr0"
+vm_ip_config   = "ip=dhcp"  # Or: "ip=192.168.1.100/24,gw=192.168.1.1"
+nameserver     = "8.8.8.8"
+
+# VM Access
+vm_user              = "ubuntu"
+vm_password          = "changeme"  # Optional if using SSH keys
+ssh_public_key       = "ssh-rsa AAAA... your-key-here"
+ssh_private_key_path = "~/.ssh/id_rsa"
