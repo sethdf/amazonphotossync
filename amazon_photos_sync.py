@@ -236,8 +236,10 @@ async def enumerate_files(full_scan=False):
     conn.close()
 
 
-async def download_files(limit=None, verify_md5=True):
+async def download_files(limit=None, verify_md5=True, smallest_first=False):
     """Download all unique files (by MD5) that haven't been downloaded yet."""
+    import httpx
+
     print("=" * 70)
     print("DOWNLOAD: Fetching files from Amazon Photos")
     print("=" * 70)
@@ -245,12 +247,13 @@ async def download_files(limit=None, verify_md5=True):
     conn = get_db()
 
     # Get unique MD5s that haven't been downloaded
-    query = """
+    order = "f.size ASC" if smallest_first else "f.size DESC"
+    query = f"""
         SELECT DISTINCT f.md5, f.id, f.name, f.size, f.extension, f.content_type
         FROM files f
         LEFT JOIN downloads d ON f.md5 = d.md5
         WHERE f.md5 IS NOT NULL AND d.md5 IS NULL
-        ORDER BY f.size DESC
+        ORDER BY {order}
     """
     pending = conn.execute(query).fetchall()
 
@@ -273,19 +276,22 @@ async def download_files(limit=None, verify_md5=True):
     download_path = Path(DOWNLOAD_DIR)
     download_path.mkdir(exist_ok=True)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(storage_state=SESSION_FILE)
-        page = await context.new_page()
+    # Load session and extract cookies
+    with open(SESSION_FILE) as f:
+        session_data = json.load(f)
 
-        # Navigate to photos to establish session
-        await page.goto("https://www.amazon.com/photos/all", timeout=30000)
-        await page.wait_for_timeout(2000)
+    cookies = {}
+    for cookie in session_data.get('cookies', []):
+        if 'amazon.com' in cookie.get('domain', ''):
+            cookies[cookie['name']] = cookie['value']
 
-        downloaded = 0
-        failed = 0
-        skipped = 0
+    print(f"Loaded {len(cookies)} cookies from session")
 
+    downloaded = 0
+    failed = 0
+    skipped = 0
+
+    async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=300.0) as client:
         for idx, (md5, file_id, name, size, ext, content_type) in enumerate(pending, 1):
             # Determine local filename - use MD5 prefix for organization
             prefix = md5[:2]
@@ -308,68 +314,65 @@ async def download_files(limit=None, verify_md5=True):
             print(f"[{idx}/{total_to_download}] Downloading: {name[:50]} ({format_size(size)})", end="", flush=True)
 
             try:
-                # Build download URL
+                # Build download URL - use the signed download endpoint
                 download_url = f"https://www.amazon.com/drive/v1/nodes/{file_id}/contentRedirection?querySuffix=%3Fdownload%3Dtrue"
 
-                # Use page.evaluate to fetch with credentials
-                # First get the redirect URL
-                result = await page.evaluate(f"""
-                    async () => {{
-                        try {{
-                            const response = await fetch("{download_url}", {{
-                                credentials: 'include',
-                                redirect: 'follow'
-                            }});
-                            const blob = await response.blob();
-                            const arrayBuffer = await blob.arrayBuffer();
-                            const uint8Array = new Uint8Array(arrayBuffer);
-                            return {{
-                                success: true,
-                                data: Array.from(uint8Array),
-                                size: blob.size,
-                                type: blob.type
-                            }};
-                        }} catch (e) {{
-                            return {{success: false, error: e.toString()}};
-                        }}
-                    }}
-                """)
+                # Stream download to file
+                md5_hash = hashlib.md5()
+                bytes_downloaded = 0
 
-                if result.get('success'):
-                    # Write file
-                    file_data = bytes(result['data'])
-                    local_file.write_bytes(file_data)
+                async with client.stream('GET', download_url) as response:
+                    if response.status_code != 200:
+                        print(f" - HTTP {response.status_code}")
+                        failed += 1
+                        continue
 
-                    # Verify MD5 if requested
-                    if verify_md5:
-                        actual_md5 = hashlib.md5(file_data).hexdigest()
-                        if actual_md5 != md5:
-                            print(f" - MD5 MISMATCH! Expected {md5}, got {actual_md5}")
-                            failed += 1
-                            local_file.unlink()
-                            continue
+                    with open(local_file, 'wb') as f:
+                        async for chunk in response.aiter_bytes(chunk_size=1024*1024):
+                            f.write(chunk)
+                            if verify_md5:
+                                md5_hash.update(chunk)
+                            bytes_downloaded += len(chunk)
 
-                    # Record download
-                    conn.execute("""
-                        INSERT OR REPLACE INTO downloads (md5, local_path, downloaded_at, source_id, verified)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (md5, str(local_file), datetime.now().isoformat(), file_id, 1 if verify_md5 else 0))
-                    conn.commit()
+                # Verify MD5 if requested
+                if verify_md5:
+                    actual_md5 = md5_hash.hexdigest()
+                    if actual_md5 != md5:
+                        print(f" - MD5 MISMATCH! Expected {md5}, got {actual_md5}")
+                        failed += 1
+                        local_file.unlink()
+                        continue
 
-                    downloaded += 1
-                    print(" - OK")
-                else:
-                    print(f" - FAILED: {result.get('error', 'Unknown error')}")
+                # Verify size
+                if bytes_downloaded != size:
+                    print(f" - SIZE MISMATCH! Expected {size}, got {bytes_downloaded}")
                     failed += 1
+                    local_file.unlink()
+                    continue
+
+                # Record download
+                conn.execute("""
+                    INSERT OR REPLACE INTO downloads (md5, local_path, downloaded_at, source_id, verified)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (md5, str(local_file), datetime.now().isoformat(), file_id, 1 if verify_md5 else 0))
+                conn.commit()
+
+                downloaded += 1
+                print(" - OK")
 
                 # Small delay to be nice to Amazon
-                await page.wait_for_timeout(200)
+                await asyncio.sleep(0.1)
 
+            except httpx.TimeoutException:
+                print(f" - TIMEOUT")
+                failed += 1
+                if local_file.exists():
+                    local_file.unlink()
             except Exception as e:
                 print(f" - ERROR: {e}")
                 failed += 1
-
-        await browser.close()
+                if local_file.exists():
+                    local_file.unlink()
 
     print(f"\n{'=' * 70}")
     print("DOWNLOAD COMPLETE")
@@ -592,13 +595,15 @@ async def main():
                         help="Limit number of files to download")
     parser.add_argument('--no-verify', action='store_true',
                         help="Skip MD5 verification on download")
+    parser.add_argument('--smallest-first', action='store_true',
+                        help="Download smallest files first (default: largest first)")
 
     args = parser.parse_args()
 
     if args.command == 'enumerate':
         await enumerate_files(full_scan=args.full)
     elif args.command == 'download':
-        await download_files(limit=args.limit, verify_md5=not args.no_verify)
+        await download_files(limit=args.limit, verify_md5=not args.no_verify, smallest_first=args.smallest_first)
     elif args.command == 'verify':
         await verify_sync()
     elif args.command == 'status':
