@@ -21,6 +21,12 @@ variable "proxmox_tls_insecure" {
   default     = true
 }
 
+variable "proxmox_ssh_password" {
+  description = "SSH password for Proxmox host (for disk operations)"
+  type        = string
+  sensitive   = true
+}
+
 variable "proxmox_node" {
   description = "Proxmox node to create VM on"
   type        = string
@@ -58,10 +64,10 @@ variable "vm_memory_min" {
   default     = 2048
 }
 
-variable "vm_disk_size" {
-  description = "Boot disk size (e.g., '50G' - needs space for ~1.2TB photos)"
-  type        = string
-  default     = "2000G"
+variable "vm_disk_size_gb" {
+  description = "Boot disk size in GB (needs space for ~1.2TB photos)"
+  type        = number
+  default     = 2000
 }
 
 variable "storage_pool" {

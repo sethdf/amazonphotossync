@@ -99,6 +99,7 @@ async def enumerate_files(full_scan=False):
     conn.commit()
 
     captured_items = []
+    captured_tokens = {}  # Track pagination tokens per request
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -111,25 +112,26 @@ async def enumerate_files(full_scan=False):
                     body = await response.json()
                     if 'data' in body:
                         captured_items.extend(body['data'])
+                    # Capture pagination token
+                    if 'nextToken' in body and body['nextToken']:
+                        captured_tokens['latest'] = body['nextToken']
                 except:
                     pass
 
         page.on("response", capture_response)
 
-        # Build list of URLs to visit - years and months for thorough coverage
-        urls_to_visit = [
-            ("All Photos", "https://www.amazon.com/photos/all"),
-            ("Videos", "https://www.amazon.com/photos/videos"),
-        ]
-
-        # Add years from 2010 to current year
+        # Build comprehensive list of time-based URLs
+        # Go year by year, and for years with many photos, also month by month
         current_year = datetime.now().year
-        for year in range(current_year, 2009, -1):
+        urls_to_visit = []
+
+        # All years from 2001 to present
+        for year in range(current_year, 2000, -1):
             urls_to_visit.append((f"Year {year}", f"https://www.amazon.com/photos/all?timeYear={year}"))
 
-        # If full scan, also do month-by-month for recent years
+        # For full scan, add month-by-month for ALL years (catches large collections)
         if full_scan:
-            for year in range(current_year, current_year - 3, -1):
+            for year in range(current_year, 2000, -1):
                 for month in range(1, 13):
                     urls_to_visit.append(
                         (f"{year}-{month:02d}",
@@ -137,33 +139,45 @@ async def enumerate_files(full_scan=False):
                     )
 
         total_urls = len(urls_to_visit)
+        print(f"Scanning {total_urls} time periods...")
+
         for idx, (label, url) in enumerate(urls_to_visit, 1):
             print(f"[{idx}/{total_urls}] Scanning {label}...", end=" ", flush=True)
             before_count = len(captured_items)
 
             try:
                 await page.goto(url, timeout=30000)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(2000)
 
-                # Scroll to load more
+                # Scroll aggressively to load all items
                 last_count = len(captured_items)
                 no_change = 0
-                for scroll in range(50):  # Up to 50 scrolls per page
-                    await page.evaluate("window.scrollBy(0, 5000)")
-                    await page.wait_for_timeout(600)
+                scroll_count = 0
+                max_scrolls = 500  # Allow many more scrolls for large collections
 
-                    if len(captured_items) == last_count:
+                while scroll_count < max_scrolls:
+                    await page.evaluate("window.scrollBy(0, 10000)")
+                    await page.wait_for_timeout(300)
+                    scroll_count += 1
+
+                    current_count = len(captured_items)
+                    if current_count == last_count:
                         no_change += 1
-                        if no_change >= 5:
+                        if no_change >= 10:  # More patience before giving up
                             break
                     else:
                         no_change = 0
-                    last_count = len(captured_items)
+                    last_count = current_count
+
+                    # Progress indicator for long scrolls
+                    if scroll_count % 50 == 0:
+                        print(f".", end="", flush=True)
 
                 new_items = len(captured_items) - before_count
-                print(f"+{new_items} (total: {len(captured_items)})")
+                print(f" +{new_items} (total: {len(captured_items)})")
+
             except Exception as e:
-                print(f"Error: {e}")
+                print(f" Error: {e}")
 
         await browser.close()
 

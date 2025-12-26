@@ -1,109 +1,113 @@
 terraform {
   required_providers {
     proxmox = {
-      source  = "Telmate/proxmox"
-      version = "~> 3.0"
+      source  = "bpg/proxmox"
+      version = "~> 0.38"
     }
   }
 }
 
 provider "proxmox" {
-  pm_api_url          = var.proxmox_api_url
-  pm_api_token_id     = var.proxmox_api_token_id
-  pm_api_token_secret = var.proxmox_api_token_secret
-  pm_tls_insecure     = var.proxmox_tls_insecure
+  endpoint = var.proxmox_api_url
+  api_token = "${var.proxmox_api_token_id}=${var.proxmox_api_token_secret}"
+  insecure = var.proxmox_tls_insecure
+
+  ssh {
+    agent = false
+    username = "root"
+    password = var.proxmox_ssh_password
+  }
 }
 
-resource "proxmox_vm_qemu" "amazon_photos_sync" {
+resource "proxmox_virtual_environment_vm" "amazon_photos_sync" {
   name        = var.vm_name
-  target_node = var.proxmox_node
-  desc        = "Amazon Photos Sync VM"
+  node_name   = var.proxmox_node
+  description = "Amazon Photos Sync VM"
 
-  # Clone from template (Ubuntu 22.04 recommended)
-  clone      = var.template_name
-  full_clone = true
+  clone {
+    vm_id = 9000
+    full  = true
+  }
 
-  # VM Resources
-  cores   = var.vm_cores
-  sockets = 1
-  memory  = var.vm_memory
-  balloon = var.vm_memory_min
+  cpu {
+    cores   = var.vm_cores
+    sockets = 1
+    type    = "host"
+  }
 
-  # CPU type
-  cpu = "host"
+  memory {
+    dedicated = var.vm_memory
+    floating  = var.vm_memory_min
+  }
 
-  # Boot disk
-  disks {
-    scsi {
-      scsi0 {
-        disk {
-          size    = var.vm_disk_size
-          storage = var.storage_pool
-        }
+  disk {
+    datastore_id = var.storage_pool
+    interface    = "scsi0"
+    size         = var.vm_disk_size_gb
+    file_format  = "raw"
+  }
+
+  network_device {
+    bridge = var.network_bridge
+    model  = "virtio"
+  }
+
+  agent {
+    enabled = true
+  }
+
+  initialization {
+    datastore_id = "local-zfs"
+    ip_config {
+      ipv4 {
+        address = "dhcp"
       }
     }
+    dns {
+      servers = [var.nameserver]
+    }
+    user_account {
+      username = var.vm_user
+      password = var.vm_password
+      keys     = [var.ssh_public_key]
+    }
   }
 
-  # Network
-  network {
-    model  = "virtio"
-    bridge = var.network_bridge
-  }
-
-  # Cloud-init configuration
-  os_type    = "cloud-init"
-  ipconfig0  = var.vm_ip_config
-  nameserver = var.nameserver
-  ciuser     = var.vm_user
-  cipassword = var.vm_password
-  sshkeys    = var.ssh_public_key
-
-  # Enable QEMU agent
-  agent = 1
-
-  # Lifecycle
   lifecycle {
     ignore_changes = [
-      network,
-      cipassword,
+      initialization,
     ]
   }
+}
 
-  # Wait for cloud-init to complete
-  provisioner "remote-exec" {
-    inline = ["cloud-init status --wait"]
+resource "null_resource" "setup" {
+  depends_on = [proxmox_virtual_environment_vm.amazon_photos_sync]
 
-    connection {
-      type        = "ssh"
-      user        = var.vm_user
-      private_key = file(var.ssh_private_key_path)
-      host        = self.default_ipv4_address
-      timeout     = "5m"
-    }
+  connection {
+    type        = "ssh"
+    user        = var.vm_user
+    private_key = file(var.ssh_private_key_path)
+    host        = proxmox_virtual_environment_vm.amazon_photos_sync.ipv4_addresses[1][0]
+    timeout     = "5m"
   }
 
-  # Run setup script
+  provisioner "remote-exec" {
+    inline = ["cloud-init status --wait || true"]
+  }
+
   provisioner "remote-exec" {
     script = "${path.module}/setup.sh"
-
-    connection {
-      type        = "ssh"
-      user        = var.vm_user
-      private_key = file(var.ssh_private_key_path)
-      host        = self.default_ipv4_address
-      timeout     = "15m"
-    }
   }
 }
 
 output "vm_ip" {
   description = "IP address of the VM"
-  value       = proxmox_vm_qemu.amazon_photos_sync.default_ipv4_address
+  value       = proxmox_virtual_environment_vm.amazon_photos_sync.ipv4_addresses[1][0]
 }
 
 output "ssh_command" {
   description = "SSH command to connect to VM"
-  value       = "ssh ${var.vm_user}@${proxmox_vm_qemu.amazon_photos_sync.default_ipv4_address}"
+  value       = "ssh ${var.vm_user}@${proxmox_virtual_environment_vm.amazon_photos_sync.ipv4_addresses[1][0]}"
 }
 
 output "next_steps" {
@@ -113,22 +117,12 @@ output "next_steps" {
     VM Created! Next steps:
 
     1. SSH into the VM:
-       ssh ${var.vm_user}@${proxmox_vm_qemu.amazon_photos_sync.default_ipv4_address}
+       ssh ${var.vm_user}@${proxmox_virtual_environment_vm.amazon_photos_sync.ipv4_addresses[1][0]}
 
-    2. Navigate to the project:
-       cd ~/amazonphotossync
-
-    3. Activate the virtual environment:
-       source .venv/bin/activate
-
-    4. Login to Amazon (headless):
-       python amazon_headless_login.py
-
-    5. Run full enumeration:
-       python amazon_photos_sync.py enumerate --full
-
-    6. Start downloading:
-       python amazon_photos_sync.py download
+    2. Run the sync:
+       ~/run_sync.sh login
+       ~/run_sync.sh enumerate
+       ~/start_download.sh
 
   EOT
 }
